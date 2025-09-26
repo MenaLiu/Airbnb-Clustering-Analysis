@@ -1,0 +1,398 @@
+---
+title: "Airbnb_clustering"
+format: html
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+library(car)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(stringr)
+library(factoextra)
+library(gridExtra)
+library(readxl)
+```
+
+## Data Exploration
+
+```{r}
+#Load the data （combine 6 months data)
+listings <- read_excel("Airbnb_merged_data.xlsx")
+```
+
+```{r}
+#Filter for Auckland Region （using variable"region_parent_name")
+listings <- listings %>% 
+  filter(str_detect(region_parent_name, "Auckland"))
+```
+
+```{r}
+#get the top 20 frequent amenities
+top_amenities <- listings %>%
+  mutate(amenities_clean = iconv(amenities, from = "", to = "UTF-8", sub = "")) %>%
+  mutate(amenities_clean = str_remove_all(amenities_clean, "\\[|\\]|\"")) %>%
+  mutate(amenities_list = str_split(amenities_clean, ",\\s*")) %>%
+  unnest(amenities_list) %>%
+  mutate(amenities_list = str_squish(amenities_list)) %>%
+  filter(amenities_list != "") %>%
+  count(amenities_list, sort = TRUE) %>%
+  slice_head(n = 20)
+
+top_amenities
+
+```
+
+```{r}
+#Get the exact number of the price
+if (!is.numeric(listings$price))
+  listings$price <- as.numeric(gsub("[^0-9.]", "", listings$price))
+
+q <- quantile(listings$price, c(0, 1/3, 2/3, 1), na.rm = TRUE)  # min, 33%, 67%, max
+names(q) <- c("min","p33","p67","max")
+print(round(q, 2))  
+
+low_max  <- q["p33"]
+med_min  <- q["p33"];  med_max <- q["p67"]
+high_min <- q["p67"]
+
+cat(sprintf(
+  "Low    : [%.2f, %.2f]\nMedium : (%.2f, %.2f]\nHigh   : (%.2f, %.2f]\n",
+  q["min"], low_max, med_min, med_max, high_min, q["max"]
+))
+
+```
+
+```{r}
+# Categorize price into 3 levels
+listings$price <- as.numeric(gsub("[$,]", "", listings$price))
+price_breaks <- quantile(listings$price, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+listings$price_level <- cut(
+  listings$price,
+  breaks = price_breaks,
+  labels = c("Low", "Medium", "High"),
+  include.lowest = TRUE
+)
+listings$price_level_code <- as.numeric(listings$price_level)
+
+# Amenities → Grouped Counts (based on top 20))
+listings <- listings %>% mutate(row_id = row_number())
+amen_long <- listings %>%
+  transmute(
+    row_id,
+    amen_str = amenities %>%
+      iconv(from = "", to = "UTF-8", sub = "") %>%
+      str_remove_all("\\[|\\]|\"")
+  ) %>%
+  mutate(amen_list = str_split(amen_str, ",\\s*")) %>%
+  select(row_id, amen_list) %>%
+  unnest(amen_list) %>%
+  transmute(row_id, amenity = str_squish(amen_list)) %>%
+  filter(amenity != "")
+
+# keep only the 20 most frequent amenities 
+top20 <- c(
+  "Smoke alarm","Wifi","Kitchen","Hot water","Dishes and silverware","Hangers",
+  "Bed linens","Hair dryer","Essentials","Microwave","Iron","Cooking basics",
+  "Refrigerator","Free parking on premises","Hot water kettle","TV","Toaster",
+  "Shampoo","Self check-in","Washer"
+)
+
+amen_long_top <- amen_long %>%
+  mutate(amenity_lc = str_to_lower(amenity)) %>%
+  filter(amenity %in% top20)
+
+# categorize into 4 sets
+safety_set     <- c("smoke alarm")
+essentials_set <- c("bed linens","hangers","essentials","shampoo","hot water")
+comfort_set    <- c("wifi","kitchen","dishes and silverware","microwave",
+                    "refrigerator","tv","toaster","hot water kettle",
+                    "iron","self check-in","cooking basics","hair dryer")
+extras_set     <- c("free parking on premises","washer")
+
+amen_long_top <- amen_long_top %>%
+  mutate(category = case_when(
+    amenity_lc %in% safety_set     ~ "Safety",
+    amenity_lc %in% essentials_set ~ "Essentials",
+    amenity_lc %in% comfort_set    ~ "Comfort",
+    amenity_lc %in% extras_set     ~ "Extras",
+    TRUE                           ~ "Other"
+  ))
+
+# per‑listing counts by category
+amen_counts <- amen_long_top %>%
+  count(row_id, category) %>%
+  tidyr::pivot_wider(
+    names_from = category,
+    values_from = n,
+    values_fill = 0,
+    names_prefix = "amen_"
+  )
+
+# ensure expected columns exist
+for (nm in c("amen_Safety","amen_Essentials","amen_Comfort","amen_Extras")) {
+  if (!nm %in% names(amen_counts)) amen_counts[[nm]] <- 0L
+}
+
+# join back
+listings <- listings %>%
+  left_join(amen_counts, by = "row_id") %>%
+  mutate(across(starts_with("amen_"), ~ replace_na(., 0L)))
+
+# Room type into numeric
+listings <- listings %>%
+  mutate(room_type_code = dplyr::recode(
+    room_type,
+    "Entire home/apt" = 1,
+    "Private room"    = 2,
+    "Hotel room"      = 3,
+    "Shared room"     = 4,
+    .default = NA_real_
+  ))
+
+# Select clustering variable
+listings_cluster <- listings %>%
+  select(
+    price_level_code,
+    review_scores_rating,
+    accommodates,
+    room_type_code,
+    bedrooms,
+    bathrooms,
+    amen_Safety, amen_Essentials, amen_Comfort, amen_Extras
+  )
+```
+
+```{r}
+#check the missing value
+colSums(is.na(listings_cluster))
+```
+
+```{r}
+#see the summary of the numeric data before replacing the missing value
+summary(listings_cluster$price_level_code) #replace missing value with Median
+summary(listings_cluster$review_scores_rating) #replace missing value with Median
+summary(listings_cluster$accommodates) #replace missing value with Median
+
+
+# Replace NA of numeric variables with median
+listings_cluster$price_level_code[is.na(listings_cluster$price_level_code)] <- median(listings_cluster$price_level_code, na.rm = TRUE)
+listings_cluster$review_scores_rating[is.na(listings_cluster$review_scores_rating)] <- median(listings_cluster$review_scores_rating, na.rm = TRUE)
+listings_cluster$accommodates[is.na(listings_cluster$accommodates)] <- median(listings_cluster$accommodates, na.rm = TRUE)
+listings_cluster$bedrooms[is.na(listings_cluster$bedrooms)] <- median(listings_cluster$bedrooms, na.rm = TRUE)
+listings_cluster$bathrooms[is.na(listings_cluster$bathrooms)] <- median(listings_cluster$bathrooms, na.rm = TRUE)
+listings_cluster$room_type_code[is.na(listings_cluster$room_type_code)] <- median(listings_cluster$room_type_code, na.rm = TRUE)
+```
+
+```{r}
+#check again if there's any missing value
+colSums(is.na(listings_cluster))
+```
+
+```{r}
+#check the correlations between the variables
+cor_matrix <- cor(listings_cluster %>%
+                    select(price_level_code,
+    review_scores_rating,
+    accommodates,
+    room_type_code,
+    bedrooms,
+    bathrooms,
+    amen_Safety, amen_Essentials, amen_Comfort, amen_Extras),
+                  use = "complete.obs")
+
+
+# delete correlated with var it self（corr=1）
+cor_df <- as.data.frame(as.table(cor_matrix))
+cor_df <- cor_df[cor_df$Var1 != cor_df$Var2, ]
+
+# Only keep corr >0.5 
+high_corr <- cor_df[abs(cor_df$Freq) > 0.5, ]
+print(high_corr)
+```
+
+```{r}
+#the dataframe delete high correlation var 
+#only delete 'bedrooms'
+filter_cluster <- listings_cluster %>%
+  select(price_level_code,
+    review_scores_rating,
+    accommodates,
+    room_type_code,
+    bathrooms,
+    amen_Safety, amen_Essentials, amen_Comfort, amen_Extras)
+```
+
+```{r}
+std_listings_cluster <- scale(listings_cluster)
+std_filter_cluster   <- scale(filter_cluster)
+```
+
+## PCA
+
+```{r}
+#results one- with all variables chose
+library(factoextra)
+pca_result1 <- prcomp(std_listings_cluster, scale. = TRUE)
+
+
+summary(pca_result1)
+
+
+fviz_pca_ind(pca_result1, geom = "point", col.ind = "cos2") +
+  theme_minimal()
+
+
+pca_data <- as.data.frame(pca_result1$x[, 1:7])
+
+# Dim1
+fviz_contrib(pca_result1, choice = 'var', axes = 1, top = 10)
+# Dim2
+fviz_contrib(pca_result1, choice = 'var', axes = 2, top = 10)
+# Dim3
+fviz_contrib(pca_result1, choice = 'var', axes = 3, top = 10)
+```
+
+```{r}
+#results two- without bedrooms var
+pca_result2 <- prcomp(std_filter_cluster, scale. = TRUE)
+
+
+summary(pca_result2)
+
+
+fviz_pca_ind(pca_result2, geom = "point", col.ind = "cos2") +
+  theme_minimal()
+
+
+pca_data <- as.data.frame(pca_result2$x[, 1:5])
+
+# Dim1
+fviz_contrib(pca_result2, choice = 'var', axes = 1, top = 10)
+# Dim2
+fviz_contrib(pca_result2, choice = 'var', axes = 2, top = 10)
+# Dim3
+fviz_contrib(pca_result2, choice = 'var', axes = 3, top = 10)
+```
+
+## K-means clustering
+
+Results one (not delete high correlation variables)
+
+```{r}
+set.seed(123)
+
+# K = 2
+k2 <- kmeans(std_listings_cluster, centers = 2, nstart = 25)
+p2 <- fviz_cluster(k2, data = std_listings_cluster, geom = "point")
+
+# K = 3
+k3 <- kmeans(std_listings_cluster, centers = 3, nstart = 25)
+p3 <- fviz_cluster(k3, data = std_listings_cluster, geom = "point")
+
+# K = 4
+k4 <- kmeans(std_listings_cluster, centers = 4, nstart = 25)
+p4 <- fviz_cluster(k4, data = std_listings_cluster, geom = "point")
+
+grid.arrange(p2, p3, p4, nrow = 1)
+
+```
+
+```{r}
+set.seed(123)
+
+# K = 2
+k2 <- kmeans(std_filter_cluster, centers = 2, nstart = 25)
+p2 <- fviz_cluster(k2, data = std_filter_cluster, geom = "point")
+
+# K = 3
+k3 <- kmeans(std_filter_cluster, centers = 3, nstart = 25)
+p3 <- fviz_cluster(k3, data = std_filter_cluster, geom = "point")
+
+# K = 4
+k4 <- kmeans(std_filter_cluster, centers = 4, nstart = 25)
+p4 <- fviz_cluster(k4, data = std_filter_cluster, geom = "point")
+
+grid.arrange(p2, p3, p4, nrow = 1)
+```
+
+## Elbow Method
+
+```{r}
+# Elbow method
+sample_data <- std_listings_cluster[sample(1:nrow(std_listings_cluster), 3000), ]
+
+fviz_nbclust(sample_data, FUNcluster = kmeans, method = "wss",
+             k.max = 10, nstart = 25) +
+  labs(subtitle = "Elbow method (Sampled 3,000 rows)")
+```
+
+```{r}
+# Elbow method
+sample_data <- std_filter_cluster[sample(1:nrow(std_filter_cluster), 3000), ]
+
+fviz_nbclust(sample_data, FUNcluster = kmeans, method = "wss",
+             k.max = 10, nstart = 25) +
+  labs(subtitle = "Elbow method (Sampled 3,000 rows)")
+```
+
+## Silhouette score
+
+```{r}
+library(tidyverse)
+library(cluster)
+library(factoextra)
+library(ggplot2)
+set.seed(123)
+X <- std_listings_cluster   
+n  <- nrow(X)
+m  <- min(3000, n)       
+idx <- sample(n, m)
+Xs  <- X[idx, , drop = FALSE]
+
+ks <- 2:8
+d  <- dist(Xs, method = "euclidean")
+
+sil_tbl <- map_dfr(ks, function(k){
+  km  <- kmeans(Xs, centers = k, nstart = 25, iter.max = 100)
+  sil <- silhouette(km$cluster, d)
+  tibble(k = k, avg_sil = mean(sil[, "sil_width"]))
+})
+
+print(sil_tbl)
+
+ggplot(sil_tbl, aes(k, avg_sil)) +
+  geom_line() + geom_point(size = 2) +
+  labs(x = "k", y = "Average silhouette", title = "Silhouette (sampled 3000)")
+```
+
+```{r}
+library(tidyverse)
+library(cluster)
+library(factoextra)
+library(ggplot2)
+set.seed(123)
+X <- std_filter_cluster 
+n  <- nrow(X)
+m  <- min(3000, n)        
+idx <- sample(n, m)
+Xs  <- X[idx, , drop = FALSE]
+
+ks <- 2:8
+d  <- dist(Xs, method = "euclidean")
+
+sil_tbl <- map_dfr(ks, function(k){
+  km  <- kmeans(Xs, centers = k, nstart = 25, iter.max = 100)
+  sil <- silhouette(km$cluster, d)
+  tibble(k = k, avg_sil = mean(sil[, "sil_width"]))
+})
+
+print(sil_tbl)
+
+ggplot(sil_tbl, aes(k, avg_sil)) +
+  geom_line() + geom_point(size = 2) +
+  labs(x = "k", y = "Average silhouette", title = "Silhouette (sampled 3000)")
+```
